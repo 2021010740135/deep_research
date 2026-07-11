@@ -16,6 +16,7 @@ class WorkflowService:
         self._base_config: AppConfig | None = None
         self._memory_manager = None
         self._app = None
+        self._pending_clarifications: dict[tuple[str, str, str], dict] = {}
 
     def _ensure_initialized(self) -> None:
         if self._initialized:
@@ -59,8 +60,24 @@ class WorkflowService:
         tenant_id: str,
         max_iterations: int | None,
         enable_memory: bool | None,
+        clarification_action: str | None = None,
+        original_query: str | None = None,
     ) -> tuple[str, str]:
         self._ensure_initialized()
+        clarification_key = (tenant_id, user_id, thread_id)
+        pending_clarification = self._pending_clarifications.get(clarification_key)
+        action = (clarification_action or "").strip()
+        if action and action not in {"direct_answer", "deep_research"}:
+            raise ValueError(f"invalid clarification_action: {action}")
+        if pending_clarification and not action:
+            raise ValueError("clarification_required")
+        effective_query = query
+        if action:
+            effective_query = (
+                str((pending_clarification or {}).get("original_query") or original_query or query).strip()
+            )
+            if not effective_query:
+                raise ValueError("missing original query for clarification")
         runtime_config = self._build_runtime_config(
             user_id=user_id,
             thread_id=thread_id,
@@ -69,33 +86,39 @@ class WorkflowService:
             enable_memory=enable_memory,
         )
         memory_context = ""
-        if self._memory_manager and runtime_config.enable_memory:
+        if self._memory_manager and runtime_config.enable_memory and route != "clarify":
             memory_context = self._memory_manager.build_personalized_prompt_context(
                 user_id=runtime_config.user_id,
                 thread_id=runtime_config.thread_id,
-                query=query,
+                query=effective_query,
                 tenant_id=runtime_config.tenant_id,
                 max_memories=runtime_config.memory_top_k,
             )
         state = create_initial_state(
-            query=query,
+            query=effective_query,
             max_iterations=runtime_config.max_iterations,
             user_id=runtime_config.user_id,
             tenant_id=runtime_config.tenant_id,
             memory_context=memory_context,
         )
+        state["clarification_action"] = action
+        state["original_query"] = effective_query if action else (original_query or "")
         result = self._app.invoke(
             state,
             {"configurable": {"thread_id": runtime_config.thread_id}},
         )
         final = result.get("final", "")
         route = str(result.get("intent", "multiagent"))
-        if self._memory_manager and runtime_config.enable_memory:
+        if route == "clarify":
+            self._pending_clarifications[clarification_key] = result.get("pending_clarification", {})
+        elif action:
+            self._pending_clarifications.pop(clarification_key, None)
+        if self._memory_manager and runtime_config.enable_memory and route != "clarify":
             self._memory_manager.persist_turn(
                 tenant_id=runtime_config.tenant_id,
                 user_id=runtime_config.user_id,
                 thread_id=runtime_config.thread_id,
-                query=query,
+                query=effective_query,
                 answer=final,
             )
         return final, route
@@ -124,8 +147,24 @@ class WorkflowService:
         max_iterations: int | None,
         enable_memory: bool | None,
         emit: Callable[[dict], None],
+        clarification_action: str | None = None,
+        original_query: str | None = None,
     ) -> tuple[str, str]:
         self._ensure_initialized()
+        clarification_key = (tenant_id, user_id, thread_id)
+        pending_clarification = self._pending_clarifications.get(clarification_key)
+        action = (clarification_action or "").strip()
+        if action and action not in {"direct_answer", "deep_research"}:
+            raise ValueError(f"invalid clarification_action: {action}")
+        if pending_clarification and not action:
+            raise ValueError("clarification_required")
+        effective_query = query
+        if action:
+            effective_query = str(
+                (pending_clarification or {}).get("original_query") or original_query or query
+            ).strip()
+            if not effective_query:
+                raise ValueError("missing original query for clarification")
         runtime_config = self._build_runtime_config(
             user_id=user_id,
             thread_id=thread_id,
@@ -138,17 +177,19 @@ class WorkflowService:
             memory_context = self._memory_manager.build_personalized_prompt_context(
                 user_id=runtime_config.user_id,
                 thread_id=runtime_config.thread_id,
-                query=query,
+                query=effective_query,
                 tenant_id=runtime_config.tenant_id,
                 max_memories=runtime_config.memory_top_k,
             )
         state = create_initial_state(
-            query=query,
+            query=effective_query,
             max_iterations=runtime_config.max_iterations,
             user_id=runtime_config.user_id,
             tenant_id=runtime_config.tenant_id,
             memory_context=memory_context,
         )
+        state["clarification_action"] = action
+        state["original_query"] = effective_query if action else (original_query or "")
         final = ""
         route = "multiagent"
         config = {"configurable": {"thread_id": runtime_config.thread_id}}
@@ -160,8 +201,24 @@ class WorkflowService:
                 if isinstance(node_output, dict):
                     if node_name == "intent":
                         detected = str(node_output.get("intent", route)).strip().lower()
-                        if detected in {"direct", "multiagent"}:
+                        if detected in {"direct", "multiagent", "clarify"}:
                             route = detected
+                    if node_name == "clarify":
+                        route = "clarify"
+                        self._pending_clarifications[clarification_key] = node_output.get("pending_clarification", {})
+                        emit(
+                            {
+                                "type": "clarify",
+                                "query": effective_query,
+                                "user_id": runtime_config.user_id,
+                                "thread_id": runtime_config.thread_id,
+                                "tenant_id": runtime_config.tenant_id,
+                                "final": str(node_output.get("final", "")),
+                                "phase": str(node_output.get("phase", "clarification_required")),
+                                "clarify_options": node_output.get("clarify_options", []),
+                                "pending_clarification": node_output.get("pending_clarification", {}),
+                            }
+                        )
                     value = node_output.get("final")
                     if value:
                         final = str(value)
@@ -169,12 +226,16 @@ class WorkflowService:
             result = self._app.invoke(state, config)
             final = str(result.get("final", ""))
             route = str(result.get("intent", route)).strip().lower()
+            if route == "clarify":
+                self._pending_clarifications[clarification_key] = result.get("pending_clarification", {})
+        if route != "clarify" and action:
+            self._pending_clarifications.pop(clarification_key, None)
         if self._memory_manager and runtime_config.enable_memory:
             self._memory_manager.persist_turn(
                 tenant_id=runtime_config.tenant_id,
                 user_id=runtime_config.user_id,
                 thread_id=runtime_config.thread_id,
-                query=query,
+                query=effective_query,
                 answer=final,
             )
         return final, route
@@ -187,6 +248,8 @@ class WorkflowService:
         tenant_id: str,
         max_iterations: int | None,
         enable_memory: bool | None,
+        clarification_action: str | None = None,
+        original_query: str | None = None,
     ) -> str:
         final, _ = await asyncio.to_thread(
             self._run_sync,
@@ -196,6 +259,8 @@ class WorkflowService:
             tenant_id,
             max_iterations,
             enable_memory,
+            clarification_action,
+            original_query,
         )
         return final
 
@@ -207,6 +272,8 @@ class WorkflowService:
         tenant_id: str,
         max_iterations: int | None,
         enable_memory: bool | None,
+        clarification_action: str | None = None,
+        original_query: str | None = None,
     ) -> tuple[str, str]:
         return await asyncio.to_thread(
             self._run_sync,
@@ -216,6 +283,8 @@ class WorkflowService:
             tenant_id,
             max_iterations,
             enable_memory,
+            clarification_action,
+            original_query,
         )
 
     async def stream_events(
@@ -226,6 +295,8 @@ class WorkflowService:
         tenant_id: str,
         max_iterations: int | None,
         enable_memory: bool | None,
+        clarification_action: str | None = None,
+        original_query: str | None = None,
     ) -> AsyncIterator[dict]:
         queue: asyncio.Queue[dict] = asyncio.Queue()
         loop = asyncio.get_running_loop()
@@ -243,8 +314,15 @@ class WorkflowService:
                     max_iterations=max_iterations,
                     enable_memory=enable_memory,
                     emit=emit,
+                    clarification_action=clarification_action,
+                    original_query=original_query,
                 )
-                emit({"type": "route", "message": "已走直接回答路径" if route == "direct" else "已走多智能体研究路径"})
+                route_messages = {
+                    "direct": "已走直接回答路径",
+                    "multiagent": "已走多智能体研究路径",
+                    "clarify": "需要你选择直接回答或深度研究",
+                }
+                emit({"type": "route", "message": route_messages.get(route, f"已走 {route} 路径")})
                 emit(
                     {
                         "type": "final",
@@ -253,6 +331,7 @@ class WorkflowService:
                         "thread_id": thread_id,
                         "tenant_id": tenant_id,
                         "final": final,
+                        "route": route,
                     }
                 )
             except Exception as exc:

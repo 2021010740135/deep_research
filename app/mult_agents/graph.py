@@ -1,10 +1,5 @@
 """工作流编排模块：定义 LangGraph 节点、条件路由与整体执行路径。"""
 
-"""
- * 小滴课堂,愿景：让技术不再难学
- * @Remark 有问题联系我【xdclass68】
- * 源码-笔记-技术交流群,官网 https://xdclass.net
-"""
 import logging
 
 from langgraph.graph import StateGraph, START, END
@@ -12,6 +7,7 @@ from langgraph.graph import StateGraph, START, END
 from .nodes import (
     bind_agent,
     intent_node,
+    clarify_node,
     direct_answer_node,
     plan_node,
     web_search_node,
@@ -27,10 +23,86 @@ from .state import ResearchState
 logger = logging.getLogger("mult_agents")
 
 
+DIRECT_CONFIDENCE_THRESHOLD = 0.90
+MULTIAGENT_CONFIDENCE_THRESHOLD = 0.85
+
+TRUSTED_DIRECT_RULES = {
+    "greeting_exact_match",
+    "introduction_keyword",
+    "simple_math",
+    "joke_request",
+}
+
+TRUSTED_MULTIAGENT_RULES = {
+    "year_trend",
+    "strong_multiagent_keyword",
+}
+
+
+def _state_confidence(state: ResearchState) -> float:
+    try:
+        return float(state.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def route_after_intent(state: ResearchState) -> str:
-    if state.get("intent") == "direct":
+    route = str(state.get("intent", "")).strip().lower()
+    confidence = _state_confidence(state)
+    source = str(state.get("intent_source", "")).strip().lower()
+    matched_rule = str(state.get("intent_matched_rule", "")).strip()
+    reason = str(state.get("intent_reason", "")).strip().lower()
+
+    if route == "multiagent":
+        if source == "user_clarification":
+            return "plan"
+        if source == "rule" and matched_rule in TRUSTED_MULTIAGENT_RULES:
+            return "plan"
+        if matched_rule == "medium_multiagent_keyword":
+            logger.info(
+                "[route_after_intent] medium keyword requires user clarification | confidence=%.2f | source=%s | reason=%s",
+                confidence,
+                source,
+                reason,
+            )
+            return "clarify"
+        if confidence >= MULTIAGENT_CONFIDENCE_THRESHOLD:
+            return "plan"
+
+        logger.info(
+            "[route_after_intent] low confidence multiagent fallback | confidence=%.2f | source=%s | rule=%s | reason=%s",
+            confidence,
+            source,
+            matched_rule,
+            reason,
+        )
+        return "clarify"
+
+    if route == "direct":
+        if source == "user_clarification":
+            return "direct_answer"
+        if source == "rule" and matched_rule in TRUSTED_DIRECT_RULES:
+            return "direct_answer"
+        if confidence >= DIRECT_CONFIDENCE_THRESHOLD:
+            return "direct_answer"
+
+        logger.info(
+            "[route_after_intent] low confidence direct fallback | confidence=%.2f | source=%s | rule=%s | reason=%s",
+            confidence,
+            source,
+            matched_rule,
+            reason,
+        )
         return "direct_answer"
-    return "plan"
+
+    logger.warning(
+        "[route_after_intent] unknown intent fallback | intent=%s | confidence=%.2f | source=%s | reason=%s",
+        route,
+        confidence,
+        source,
+        reason,
+    )
+    return "direct_answer"
 
 
 def should_continue_research(state: ResearchState) -> str:
@@ -52,6 +124,7 @@ def should_continue_research(state: ResearchState) -> str:
 def build_app(agents, checkpointer):
     workflow = StateGraph(ResearchState)
     workflow.add_node("intent", bind_agent(intent_node, agents.intent_router, "intent_router"))
+    workflow.add_node("clarify", clarify_node)
     workflow.add_node("direct_answer", bind_agent(direct_answer_node, agents.direct_responder, "direct_responder"))
     workflow.add_node("plan", bind_agent(plan_node, agents.planner, "planner"))
     workflow.add_node("web_search", bind_agent(web_search_node, agents.scout_web, "scout_web"))
@@ -67,6 +140,7 @@ def build_app(agents, checkpointer):
         route_after_intent,
         {
             "direct_answer": "direct_answer",
+            "clarify": "clarify",
             "plan": "plan",
         },
     )
@@ -87,6 +161,7 @@ def build_app(agents, checkpointer):
     
     workflow.add_edge("reflect", "web_search")
     workflow.add_edge("reflect", "local_rag")
+    workflow.add_edge("clarify", END)
     workflow.add_edge("direct_answer", END)
     workflow.add_edge("write", END)
     

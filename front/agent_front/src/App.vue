@@ -2,16 +2,37 @@
 import { nextTick, ref } from 'vue'
 
 type StreamEvent = {
-  type: 'status' | 'phase' | 'route' | 'final' | 'error'
+  type: 'status' | 'phase' | 'route' | 'final' | 'error' | 'clarify'
   message?: string
   final?: string
   node?: string
+  route?: string
+  phase?: string
+  clarify_options?: ClarifyOption[]
+  pending_clarification?: PendingClarification
+}
+
+type ClarifyOption = {
+  id: 'direct_answer' | 'deep_research'
+  label: string
+  description?: string
+}
+
+type PendingClarification = {
+  original_query: string
+  confidence?: number
+  reason?: string
+  source?: string
+  matched_rule?: string
 }
 
 type ChatMessage = {
   id: string
   role: 'user' | 'assistant' | 'status'
   content: string
+  clarifyOptions?: ClarifyOption[]
+  pendingClarification?: PendingClarification
+  clarificationHandled?: boolean
 }
 
 const userId = ref('user01')
@@ -23,6 +44,7 @@ const errorMessage = ref('')
 const messageListRef = ref<HTMLElement | null>(null)
 const composerRef = ref<HTMLTextAreaElement | null>(null)
 const progressLogs = ref<string[]>([])
+const pendingClarification = ref<PendingClarification | null>(null)
 const starterPrompts = [
   {
     title: '深度调研',
@@ -155,6 +177,7 @@ const createNewChat = () => {
     },
   ]
   progressLogs.value = []
+  pendingClarification.value = null
   errorMessage.value = ''
   query.value = ''
 }
@@ -183,14 +206,24 @@ const pushProgress = (message: string) => {
   }
 }
 
-const runResearch = async () => {
-  const userText = query.value.trim()
+const runResearch = async (
+  override?: {
+    queryText: string
+    displayText?: string
+    clarificationAction?: ClarifyOption['id']
+    originalQuery?: string
+  },
+) => {
+  const userText = (override?.queryText ?? query.value).trim()
   if (!userText || loading.value) return
+  if (pendingClarification.value && !override?.clarificationAction) return
   loading.value = true
   errorMessage.value = ''
   progressLogs.value = []
-  query.value = ''
-  messages.value.push({ id: `u-${Date.now()}`, role: 'user', content: userText })
+  if (!override) {
+    query.value = ''
+  }
+  messages.value.push({ id: `u-${Date.now()}`, role: 'user', content: override?.displayText || userText })
   const statusId = `s-${Date.now()}`
   messages.value.push({ id: statusId, role: 'status', content: '正在初始化执行链路...' })
   const renderStatusText = () => {
@@ -210,6 +243,8 @@ const runResearch = async () => {
         user_id: userId.value.trim() || 'default_user',
         thread_id: threadId.value.trim() || 'default_thread',
         tenant_id: tenantId.value.trim() || 'default_tenant',
+        clarification_action: override?.clarificationAction,
+        original_query: override?.originalQuery,
       }),
     })
     if (!response.ok) {
@@ -238,8 +273,23 @@ const runResearch = async () => {
           pushProgress(`${prefix}${event.message || ''}`)
           renderStatusText()
         }
-        if (event.type === 'final') {
+        if (event.type === 'clarify') {
           messages.value = messages.value.filter((item) => item.id !== statusId)
+          pendingClarification.value = event.pending_clarification || null
+          messages.value.push({
+            id: `c-${Date.now()}`,
+            role: 'assistant',
+            content: event.final || '请选择直接回答或深度研究。',
+            clarifyOptions: event.clarify_options || [],
+            pendingClarification: event.pending_clarification,
+          })
+        }
+        if (event.type === 'final') {
+          if (event.route === 'clarify') {
+            continue
+          }
+          messages.value = messages.value.filter((item) => item.id !== statusId)
+          pendingClarification.value = null
           messages.value.push({
             id: `a-${Date.now()}`,
             role: 'assistant',
@@ -264,6 +314,20 @@ const runResearch = async () => {
     loading.value = false
     await scrollToBottom()
   }
+}
+
+const submitClarification = async (message: ChatMessage, option: ClarifyOption) => {
+  const pending = message.pendingClarification || pendingClarification.value
+  const originalQuery = pending?.original_query?.trim()
+  if (!originalQuery || loading.value) return
+  message.clarificationHandled = true
+  pendingClarification.value = null
+  await runResearch({
+    queryText: originalQuery,
+    displayText: option.label,
+    clarificationAction: option.id,
+    originalQuery,
+  })
 }
 </script>
 
@@ -371,7 +435,21 @@ const runResearch = async () => {
           :class="`role-${message.role}`"
         >
           <div class="avatar">{{ message.role === 'user' ? '你' : message.role === 'status' ? '...' : 'AI' }}</div>
-          <div class="bubble markdown-body" v-html="renderMessageHtml(message)"></div>
+          <div class="message-content">
+            <div class="bubble markdown-body" v-html="renderMessageHtml(message)"></div>
+            <div v-if="message.clarifyOptions?.length" class="clarify-actions">
+              <button
+                v-for="option in message.clarifyOptions"
+                :key="option.id"
+                class="clarify-btn"
+                :disabled="loading || message.clarificationHandled"
+                @click="submitClarification(message, option)"
+              >
+                <span>{{ option.label }}</span>
+                <small v-if="option.description">{{ option.description }}</small>
+              </button>
+            </div>
+          </div>
         </div>
       </div>
       <div class="composer">
@@ -379,11 +457,11 @@ const runResearch = async () => {
           v-model="query"
           ref="composerRef"
           class="composer-input"
-          :disabled="loading"
-          placeholder="输入你的问题，回车发送（Shift + Enter 换行）"
-          @keydown.enter.exact.prevent="runResearch"
+          :disabled="loading || !!pendingClarification"
+          :placeholder="pendingClarification ? '请先选择上方的处理方式' : '输入你的问题，回车发送（Shift + Enter 换行）'"
+          @keydown.enter.exact.prevent="() => runResearch()"
         />
-        <button class="send-btn" :disabled="loading || !query.trim()" @click="runResearch">
+        <button class="send-btn" :disabled="loading || !!pendingClarification || !query.trim()" @click="runResearch()">
           {{ loading ? '处理中...' : '发送' }}
         </button>
       </div>

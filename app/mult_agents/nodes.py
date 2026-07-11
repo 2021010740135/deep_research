@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+from dataclasses import dataclass
 from functools import partial
 
 from langchain_core.messages import HumanMessage
@@ -76,56 +77,107 @@ def log_inputs(node: str, agent_name: str, payload: dict):
     logger.info("%s 输入 | agent=%s | data=%s", colorize(f"[{node}]", "cyan"), colorize(agent_name, "magenta"), preview)
 
 
-def detect_intent(query: str) -> str:
-    normalized_query = query.strip()
-    force_multiagent_keywords = [
-        "调查",
-        "调研",
-        "来源",
-        "证据",
-        "检索统计",
-        "来源清单",
-        "重大新闻",
-        "热门项目",
-        "趋势",
-        "新闻",
-        "最新",
-        "盘点",
-    ]
-    if re.search(r"20\d{2}年", normalized_query) and any(word in normalized_query for word in ["趋势", "新闻", "调研", "调查", "盘点"]):
-        return "multiagent"
-    if any(word in query for word in force_multiagent_keywords):
-        return "multiagent"
-    keywords = [
-        "调研",
-        "研究",
-        "调查",
-        "盘点",
-        "热门",
-        "趋势",
-        "榜单",
-        "分析",
-        "方案",
-        "架构",
-        "设计",
-        "对比",
-        "报告",
-        "代码",
-        "实现",
-        "落地",
-        "检索",
-        "知识库",
-        "证据",
-        "来源",
-        "溯源",
-        "资料",
-        "手册",
-        "验证",
-        "数据",
-        "模型",
-    ]
-    return "multiagent" if any(word in query for word in keywords) else "direct"
+@dataclass(frozen=True)
+class IntentDecision:
+    route: str
+    confidence: float
+    reason: str
+    source: str = "rule"
+    matched_rule: str = ""
 
+    def __iter__(self):
+        yield self.route
+        yield self.confidence
+
+    def as_dict(self) -> dict:
+        return {
+            "route": self.route,
+            "confidence": self.confidence,
+            "reason": self.reason,
+            "source": self.source,
+            "matched_rule": self.matched_rule,
+        }
+
+
+def _intent_decision(route: str, confidence: float, reason: str, matched_rule: str) -> IntentDecision:
+    return IntentDecision(
+        route=route,
+        confidence=confidence,
+        reason=reason,
+        matched_rule=matched_rule,
+    )
+
+
+def detect_intent(query: str) -> IntentDecision:
+    normalized_query = query.strip()
+    lowered_query = normalized_query.lower()
+    if not normalized_query:
+        return _intent_decision("direct", 0.45, "empty query", "empty_query")
+
+    force_multiagent_keywords = [
+        "调查", "调研", "来源", "证据", "检索统计", "来源清单",
+        "重大新闻", "热门项目", "趋势", "新闻", "最新", "盘点",
+    ]
+
+    if re.search(r"20\d{2}年", normalized_query) and any(
+        word in normalized_query for word in ["趋势", "新闻", "调研", "调查", "盘点"]
+    ):
+        return _intent_decision("multiagent", 0.95, "year plus research/trend keyword", "year_trend")
+
+    matched_force_keyword = next((word for word in force_multiagent_keywords if word in normalized_query), "")
+    if matched_force_keyword:
+        return _intent_decision(
+            "multiagent",
+            0.92,
+            f"matched strong multiagent keyword: {matched_force_keyword}",
+            "strong_multiagent_keyword",
+        )
+
+    medium_multiagent_keywords = [
+        "研究", "热门", "榜单", "分析", "方案", "架构", "设计",
+        "对比", "比较", "报告", "总结", "代码", "实现", "落地",
+        "检索", "知识库", "溯源", "资料", "手册", "验证", "数据", "模型",
+        "哪个更好", "vs",
+    ]
+    matched_medium_keyword = next((word for word in medium_multiagent_keywords if word in normalized_query), "")
+    if matched_medium_keyword:
+        return _intent_decision(
+            "multiagent",
+            0.70,
+            f"matched medium multiagent keyword: {matched_medium_keyword}",
+            "medium_multiagent_keyword",
+        )
+
+    greetings = ["你好", "在吗", "早上好", "晚上好", "嗨", "hello", "hi"]
+    if lowered_query in greetings:
+        return _intent_decision("direct", 0.98, "exact greeting", "greeting_exact_match")
+
+    introductions = ["你是谁", "你能做什么", "介绍你自己", "你的名字"]
+    matched_introduction = next((word for word in introductions if word in normalized_query), "")
+    if matched_introduction:
+        return _intent_decision(
+            "direct",
+            0.95,
+            f"matched introduction keyword: {matched_introduction}",
+            "introduction_keyword",
+        )
+
+    if re.search(r"\d+\s*[+加减\-]\s*\d+", normalized_query) or any(
+        word in normalized_query for word in ["等于几", "是多少"]
+    ):
+        return _intent_decision("direct", 0.90, "simple arithmetic query", "simple_math")
+
+    if "笑话" in normalized_query:
+        return _intent_decision("direct", 0.92, "joke request", "joke_request")
+
+    return _intent_decision(
+        "direct",
+        0.45,
+        "ambiguous query defaults to direct with low confidence",
+        "ambiguous_default",
+    )
+
+RULE_SKIP_THRESHOLD = 0.85
 
 def bind_agent(node_func, agent, agent_name: str):
     return partial(node_func, agent=agent, agent_name=agent_name)
@@ -941,25 +993,137 @@ def _ensure_reference_section(content: str, state: ResearchState) -> str:
 
 def intent_node(state: ResearchState, agent, agent_name: str) -> ResearchState:
     logger.info("%s 开始 | agent=%s", colorize("[intent]", "cyan"), colorize(agent_name, "magenta"))
-    rule_route = detect_intent(state["query"])
+
+    clarification_action = str(state.get("clarification_action", "")).strip()
+    if clarification_action in {"direct_answer", "deep_research"}:
+        route = "direct" if clarification_action == "direct_answer" else "multiagent"
+        reason = f"user selected {clarification_action}"
+        logger.info(
+            "%s 用户澄清选择 | action=%s | route=%s",
+            colorize("[intent]", "green"),
+            clarification_action,
+            route,
+        )
+        return {
+            "intent": route,
+            "confidence": 1.0,
+            "intent_reason": reason,
+            "intent_source": "user_clarification",
+            "intent_matched_rule": "user_clarification",
+            "draft": reason,
+            "messages": [],
+        }
+
+    rule_decision = detect_intent(state["query"])
+    rule_route, rule_confidence = rule_decision
+    rule_reason = getattr(rule_decision, "reason", "rule")
+    rule_source = getattr(rule_decision, "source", "rule")
+    rule_matched_rule = getattr(rule_decision, "matched_rule", "")
+
+    if rule_confidence >= RULE_SKIP_THRESHOLD:
+        logger.info(
+            "%s 规则引擎高置信度命中 | route=%s | confidence=%.2f | rule=%s",
+            colorize("[intent]", "green"),
+            rule_route,
+            rule_confidence,
+            rule_matched_rule,
+        )
+        return {
+            "intent": rule_route,
+            "confidence": rule_confidence,
+            "intent_reason": rule_reason,
+            "intent_source": rule_source,
+            "intent_matched_rule": rule_matched_rule,
+            "draft": f"规则引擎判定：{rule_route}",
+            "messages": [],
+        }
+
     prompt = (
         f"用户问题：{state['query']}\n"
         f"规则引擎初判：{rule_route}\n"
-        "请输出 JSON：{\"route\":\"direct|multiagent\",\"reason\":\"...\"}"
+        f"规则引擎置信度：{rule_confidence}\n"
+        f"规则引擎原因：{rule_reason}\n"
+        "请只输出 JSON，例如："
+        "{\"route\":\"direct\",\"reason\":\"...\",\"confidence\":0.82}"
     )
+
     payload, content, messages = _invoke_json_agent(
         state,
         prompt,
         agent,
         agent_name,
         "intent",
-        {"route": rule_route, "reason": "rule"},
+        {"route": rule_route, "reason": rule_reason, "confidence": rule_confidence},
     )
+
     route = str(payload.get("route", rule_route)).strip().lower()
+    confidence = float(payload.get("confidence", rule_confidence))
+    reason = str(payload.get("reason", rule_reason)).strip() or rule_reason
+
     if route not in {"direct", "multiagent"}:
         route = rule_route
-    logger.info("%s 路由: %s", colorize("[intent]", "green"), route)
-    return {"intent": route, "draft": content, "messages": messages}
+        reason = f"invalid llm route fallback: {reason}"
+
+    logger.info(
+        "%s 路由: %s | 置信度: %.2f | source=llm | reason=%s",
+        colorize("[intent]", "green"),
+        route,
+        confidence,
+        reason,
+    )
+    return {
+        "intent": route,
+        "confidence": confidence,
+        "intent_reason": reason,
+        "intent_source": "llm",
+        "intent_matched_rule": rule_matched_rule,
+        "draft": content,
+        "messages": messages,
+    }
+
+
+def clarify_node(state: ResearchState) -> ResearchState:
+    logger.info("%s 开始", colorize("[clarify]", "cyan"))
+    query = state.get("query", "").strip()
+    confidence = state.get("confidence", 0.0)
+    reason = state.get("intent_reason", "").strip()
+    options = [
+        {
+            "id": "direct_answer",
+            "label": "直接回答",
+            "description": "不检索，不启动多 Agent，直接给出简短回答",
+        },
+        {
+            "id": "deep_research",
+            "label": "深度研究",
+            "description": "启动多 Agent，进行检索、验证和报告生成",
+        },
+    ]
+    pending = {
+        "original_query": query,
+        "confidence": confidence,
+        "reason": reason,
+        "source": state.get("intent_source", ""),
+        "matched_rule": state.get("intent_matched_rule", ""),
+    }
+    message = (
+        "我还不能确定你是想要一个简短回答，还是要启动深度研究流程。\n\n"
+        f"你的问题：{query}\n"
+        f"当前路由置信度：{confidence}\n"
+        f"不确定原因：{reason or '意图边界不清晰'}\n\n"
+        "请选择处理方式：直接回答，或深度研究。"
+    )
+    emit("clarify", message)
+    return {
+        "intent": "clarify",
+        "phase": "clarification_required",
+        "draft": message,
+        "final": message,
+        "clarify_options": options,
+        "pending_clarification": pending,
+        "needs_more_research": False,
+        "messages": [],
+    }
 
 
 def direct_answer_node(state: ResearchState, agent, agent_name: str) -> ResearchState:

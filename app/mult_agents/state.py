@@ -44,6 +44,14 @@ class ResearchState(TypedDict):
     final: str
     iteration: int
     max_iterations: int
+    confidence: float
+    intent_reason: str
+    intent_source: str
+    intent_matched_rule: str
+    clarify_options: list[dict]
+    pending_clarification: dict
+    clarification_action: str
+    original_query: str
 
 
 def create_initial_state(
@@ -60,6 +68,14 @@ def create_initial_state(
         "memory_context": memory_context,
         "messages": [],
         "intent": "",
+        "confidence": 0.0,
+        "intent_reason": "",
+        "intent_source": "",
+        "intent_matched_rule": "",
+        "clarify_options": [],
+        "pending_clarification": {},
+        "clarification_action": "",
+        "original_query": "",
         "phase": "initialized",
         "plan": "",
         "outline": [],
