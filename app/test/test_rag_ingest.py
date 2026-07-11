@@ -1,4 +1,5 @@
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -20,7 +21,7 @@ class RAGIngestPathTest(unittest.TestCase):
             paths = ingest._collect_paths(root)
 
         self.assertEqual(
-            ["a.md", "b.txt", "c.markdown"],
+            ["a.md", "b.txt", "c.markdown", "paper.pdf"],
             [path.name for path in paths],
         )
 
@@ -68,6 +69,37 @@ class RAGIngestPathTest(unittest.TestCase):
         self.assertEqual("competitors/Copilot.md", metadata["relative_path"])
         self.assertEqual(".md", metadata["file_type"])
         self.assertEqual("competitors", metadata["doc_type"])
+
+    def test_read_document_text_extracts_pdf_pages(self) -> None:
+        class FakePage:
+            def __init__(self, text: str):
+                self.text = text
+
+            def extract_text(self) -> str:
+                return self.text
+
+        class FakePdfReader:
+            def __init__(self, path: str):
+                self.path = path
+                self.pages = [FakePage("page one"), FakePage("page two")]
+
+        fake_pypdf = types.SimpleNamespace(PdfReader=FakePdfReader)
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict("sys.modules", {"pypdf": fake_pypdf}):
+            path = Path(tmp) / "paper.pdf"
+            path.write_bytes(b"%PDF")
+
+            text = ingest._read_document_text(path)
+
+        self.assertEqual("[page 1]\npage one\n\n[page 2]\npage two", text)
+
+    def test_read_document_text_raises_clear_error_without_pypdf(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict("sys.modules", {"pypdf": None}):
+            path = Path(tmp) / "paper.pdf"
+            path.write_bytes(b"%PDF")
+
+            with self.assertRaisesRegex(RuntimeError, "requires pypdf"):
+                ingest._read_document_text(path)
 
 
 if __name__ == "__main__":

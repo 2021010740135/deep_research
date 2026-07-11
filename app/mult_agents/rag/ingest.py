@@ -22,7 +22,7 @@ if env_path.exists():
     load_dotenv(dotenv_path=env_path)
 
 
-SUPPORTED_SUFFIXES = (".txt", ".md", ".markdown")
+SUPPORTED_SUFFIXES = (".txt", ".md", ".markdown", ".pdf")
 COLLECTION_NAME = ""
 MILVUS_HOST = ""
 MILVUS_PORT = 0
@@ -118,10 +118,35 @@ def _metadata_for_path(path: Path, input_root: Path, topic: str | None = None) -
     return metadata
 
 
+def _read_document_text(path: Path) -> str:
+    if path.suffix.lower() == ".pdf":
+        return _extract_pdf_text(path)
+    return path.read_text(encoding="utf-8")
+
+
+def _extract_pdf_text(path: Path) -> str:
+    try:
+        from pypdf import PdfReader
+    except ImportError as exc:
+        raise RuntimeError(
+            "PDF ingestion requires pypdf. Install it with: uv add pypdf"
+        ) from exc
+
+    reader = PdfReader(str(path))
+    pages: list[str] = []
+    for index, page in enumerate(reader.pages, 1):
+        text = (page.extract_text() or "").strip()
+        if text:
+            pages.append(f"[page {index}]\n{text}")
+    if not pages:
+        raise ValueError(f"No extractable text found in PDF: {path}")
+    return "\n\n".join(pages)
+
+
 def _ingest_files(rag: RAGSystem, paths: list[Path], input_root: Path, topic: str | None) -> int:
     total = 0
     for path in paths:
-        text = path.read_text(encoding="utf-8")
+        text = _read_document_text(path)
         total += rag.ingest_text(
             text,
             source=str(path),
